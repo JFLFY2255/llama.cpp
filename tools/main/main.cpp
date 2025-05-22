@@ -275,6 +275,19 @@ int main(int argc, char ** argv) {
 
     std::string prompt;
     {
+        // 支持 -p @file.txt 方式从文件读取prompt
+        if (!params.prompt.empty() && params.prompt[0] == '@') {
+            std::ifstream fin(params.prompt.substr(1));
+            if (!fin) {
+                LOG_ERR("无法打开prompt文件: %s\n", params.prompt.substr(1).c_str());
+                return 1;
+            }
+            std::ostringstream ss;
+            ss << fin.rdbuf();
+            params.prompt = ss.str();
+        }
+        // LOG_INF("prompt: %s, prompt length: %zu\n", params.prompt.c_str(), params.prompt.length());
+
         if (params.conversation_mode && params.enable_chat_template) {
             if (!params.system_prompt.empty()) {
                 // format the system prompt (will use template default if empty)

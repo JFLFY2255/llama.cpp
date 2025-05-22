@@ -11,6 +11,8 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -37,6 +39,23 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
+    }
+
+    // 支持 @file.txt 方式从文件读取prompt
+    if (!params.prompt.empty() && params.prompt[0] == '@') {
+        std::string filename = params.prompt.substr(1);
+        std::ifstream fin(filename);
+        if (!fin) {
+            LOG_ERR("%s: 无法打开prompt文件: %s\n", __func__, filename.c_str());
+            return 1;
+        }
+        std::ostringstream ss;
+        ss << fin.rdbuf();
+        params.prompt = ss.str();
+        if (!params.prompt.empty() && params.prompt.back() == '\n') {
+            params.prompt.pop_back();
+        }
+        LOG_INF("从文件 '%s' 读取prompt\n", filename.c_str());
     }
 
     if (params.n_predict < -1) {
