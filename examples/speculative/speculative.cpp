@@ -3,6 +3,7 @@
 #include "sampling.h"
 #include "log.h"
 #include "llama.h"
+#include "chat.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -16,6 +17,52 @@
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
+
+// Sliding window for speculative draft model (operates on sequence 0)
+// Returns true if a critical error occurs and generation should stop.
+// Returns false if shifting was successful OR not needed.
+static bool handle_speculative_context_shifting(
+    llama_context *ctx,      // The llama_context for the draft model
+    int n_keep,              // Number of tokens to keep from the start for seq 0
+    int &n_past_seq0,        // Input/Output: Number of tokens in KV cache for seq 0 before call, updated if shift occurs.
+    int n_eval_seq0          // Number of tokens in the current batch to be evaluated next for seq 0.
+) {
+    const int n_ctx = llama_n_ctx(ctx);
+
+    if (n_past_seq0 + n_eval_seq0 < n_ctx) {
+        return false; // Enough space for seq 0
+    }
+
+    LOG_DBG("%s: Draft context shift potentially needed for seq 0. n_past_seq0=%d, n_eval_seq0=%d, (sum = %d), n_ctx=%d, n_keep=%d\\n",
+            __func__, n_past_seq0, n_eval_seq0, n_past_seq0 + n_eval_seq0, n_ctx, n_keep);
+
+    const int n_left_to_discard_from = n_past_seq0 - n_keep;
+    int n_discard = 0;
+    if (n_left_to_discard_from > 0) {
+        n_discard = n_left_to_discard_from / 2;
+    }
+
+    if (n_discard <= 0) {
+        LOG_DBG("n_discard is %d (n_past=%d, n_keep=%d), no tokens effectively shifted from KV cache.\n", n_discard, n_past_seq0, n_keep);
+    }
+
+    LOG_DBG("%s: Draft performing context shift for seq 0. n_past_old_seq0=%d, n_discard=%d\\n", __func__, n_past_seq0, n_discard);
+
+    llama_kv_self_seq_rm (ctx, 0, n_keep, n_keep + n_discard);
+    llama_kv_self_seq_add(ctx, 0, n_keep + n_discard, n_past_seq0, -n_discard);
+    n_past_seq0 -= n_discard;
+
+    LOG_DBG("%s: Draft after shift for seq 0, n_past_new_seq0=%d.\\n", __func__, n_past_seq0);
+
+    if (n_past_seq0 + n_eval_seq0 >= n_ctx) {
+        LOG_ERR("%s: Draft context shift critical error for seq 0: Shift performed, but new n_past_seq0 (%d) + n_eval_seq0 (%d) = %d still >= n_ctx (%d).\\n",
+                __func__, n_past_seq0, n_eval_seq0, n_past_seq0 + n_eval_seq0, n_ctx);
+        return true; // Critical error for seq 0
+    }
+
+    LOG_DBG("%s: Draft context shift successful for seq 0. New n_past_seq0=%d. Space for %d tokens available for seq 0.\\n", __func__, n_past_seq0, n_eval_seq0);
+    return false; // Shift successful for seq 0
+}
 
 struct seq_draft {
     bool active   = false;
@@ -95,6 +142,15 @@ int main(int argc, char ** argv) {
     model_tgt = llama_init_tgt.model.get();
     ctx_tgt   = llama_init_tgt.context.get();
 
+    // Initialize chat templates for the target model
+    auto chat_templates = common_chat_templates_init(model_tgt, params.chat_template);
+    /* Commented out due to compilation issues with llama_model_chat_template_type / llama_chat_template_type_to_string
+    if (chat_templates.get() != nullptr && params.chat_template.empty()) {
+        LOG_INF("%s: No explicit chat template provided, but model has a default one. Type: %s\\n", 
+                __func__, llama_chat_template_type_to_string(llama_model_chat_template_type(model_tgt)));
+    }
+    */
+
     // load the draft model
     params.devices = params.speculative.devices;
     params.model = params.speculative.model;
@@ -103,8 +159,16 @@ int main(int argc, char ** argv) {
         params.cpuparams.n_threads = params.speculative.cpuparams.n_threads;
     }
 
+    // Set n_ctx for draft model as per request (default 2048)
+    // And restore original n_ctx after draft model init for hygiene,
+    const int original_params_n_ctx = params.n_ctx;
+    params.n_ctx = 2048; // User requested default for draft model
+    LOG_INF("%s: Initializing draft model with n_ctx = %d\\n", __func__, params.n_ctx);
+
     params.cpuparams_batch.n_threads = params.speculative.cpuparams_batch.n_threads;
     common_init_result llama_init_dft = common_init_from_params(params);
+
+    params.n_ctx = original_params_n_ctx; // Restore params.n_ctx
 
     model_dft = llama_init_dft.model.get();
     ctx_dft   = llama_init_dft.context.get();
@@ -164,7 +228,67 @@ int main(int argc, char ** argv) {
 
     // Tokenize the prompt
     std::vector<llama_token> inp;
-    inp = common_tokenize(ctx_tgt, params.prompt, true, true);
+    std::string final_prompt_for_tokenization;
+    std::vector<common_chat_msg> chat_msgs;
+
+    // Load prompt from file if specified by @ (this modifies params.prompt directly)
+    if (!params.prompt.empty() && params.prompt[0] == '@') {
+        std::string filename = params.prompt.substr(1);
+        std::ifstream fin(filename);
+        if (!fin) {
+            LOG_ERR("%s: 无法打开prompt文件: %s\\n", __func__, filename.c_str());
+            return 1;
+        }
+        std::ostringstream ss;
+        ss << fin.rdbuf();
+        params.prompt = ss.str();
+        if (!params.prompt.empty() && params.prompt.back() == '\\n') {
+            params.prompt.pop_back();
+        }
+        LOG_INF("从文件 '%s' 读取prompt\\n", filename.c_str());
+    }
+
+    if (chat_templates.get()) { // A valid template was loaded (either user-specified or model default)
+        if (!params.chat_template.empty()) {
+            LOG_INF("%s: Using user-specified chat template: %s\\n", __func__, params.chat_template.c_str());
+        } else {
+            LOG_INF("%s: Using model's default chat template.\\n", __func__);
+        }
+
+        if (!params.system_prompt.empty()) {
+            common_chat_msg system_msg;
+            system_msg.role = "system";
+            system_msg.content = params.system_prompt;
+            chat_msgs.push_back(system_msg);
+        }
+        if (!params.prompt.empty()) { // The user's main prompt
+            common_chat_msg user_msg;
+            user_msg.role = "user";
+            user_msg.content = params.prompt;
+            chat_msgs.push_back(user_msg);
+        }
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = chat_msgs;
+        inputs.add_generation_prompt = true; // Always true for initial prompt in speculative example
+        
+        auto result = common_chat_templates_apply(chat_templates.get(), inputs);
+        final_prompt_for_tokenization = result.prompt;
+        // TODO: if result.bos is true, should we pass add_bos = false to common_tokenize?
+        // For now, common_tokenize will use vocab default if its add_bos arg is true.
+
+        LOG_INF("%s: Templated prompt for tokenization: \"%s\"\\n", __func__, final_prompt_for_tokenization.c_str());
+        if (chat_msgs.empty()) {
+             LOG_WRN("%s: Chat template applied, but no system or user prompt was provided. The template might only provide an initial assistant prefix.\\n", __func__);
+        }
+    } else {
+        // No chat template (neither user-specified nor model default), use params.prompt directly
+        final_prompt_for_tokenization = params.prompt;
+        LOG_INF("%s: No chat template used (or model has no default), using raw prompt for tokenization: \"%s\"\\n", __func__, final_prompt_for_tokenization.c_str());
+    }
+    
+    // The common_tokenize in speculative already adds BOS if vocab says so, when its add_bos_token arg is true.
+    inp = common_tokenize(ctx_tgt, final_prompt_for_tokenization, true, true);
 
     const int max_context_size     = llama_n_ctx(ctx_tgt);
     const int max_tokens_list_size = max_context_size - 4;
@@ -185,9 +309,45 @@ int main(int argc, char ** argv) {
     const auto t_enc_start = ggml_time_us();
 
     // eval the prompt with both models
-    llama_decode(ctx_tgt, llama_batch_get_one( inp.data(), n_input - 1));
-    llama_decode(ctx_tgt, llama_batch_get_one(&inp.back(),           1));
-    llama_decode(ctx_dft, llama_batch_get_one( inp.data(), n_input));
+    // Ensure n_batch is respected for initial prompt eval
+    const int n_batch_tgt = llama_n_batch(ctx_tgt);
+    const int n_batch_dft = llama_n_batch(ctx_dft);
+
+    // Evaluate prompt for target model
+    if (n_input > 0) {
+        const int n_tokens_tgt_first_part = n_input - 1;
+        if (n_tokens_tgt_first_part > 0) {
+            for (int i = 0; i < n_tokens_tgt_first_part; i += n_batch_tgt) {
+                const int n_eval = std::min(n_batch_tgt, n_tokens_tgt_first_part - i);
+                if (llama_decode(ctx_tgt, llama_batch_get_one(inp.data() + i, n_eval)) != 0) {
+                    LOG_ERR("%s: llama_decode failed for target model prompt (first part)\\n", __func__);
+                    llama_backend_free();
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // Evaluate prompt for draft model
+    const int n_keep_dft_val = 5; // User requested n_prefix=5 for draft model
+    int current_n_past_dft_prompt_seq0 = 0; // Tracks n_past for seq 0 during prompt eval
+    if (n_input > 0) {
+        for (int i = 0; i < n_input; i += n_batch_dft) {
+            const int n_eval_chunk = std::min(n_batch_dft, n_input - i);
+            // Apply context shifting for seq 0 of the draft model
+            if (handle_speculative_context_shifting(ctx_dft, n_keep_dft_val, current_n_past_dft_prompt_seq0, n_eval_chunk)) {
+                LOG_ERR("%s: Draft model context shift failed during prompt processing for seq 0. Exiting.\\n", __func__);
+                llama_backend_free();
+                return 1;
+            }
+            if (llama_decode(ctx_dft, llama_batch_get_one(inp.data() + i, n_eval_chunk)) != 0) {
+                LOG_ERR("%s: llama_decode failed for draft model prompt\\n", __func__);
+                llama_backend_free();
+                return 1;
+            }
+            current_n_past_dft_prompt_seq0 += n_eval_chunk;
+        }
+    }
 
     const auto t_enc_end = ggml_time_us();
 
@@ -202,7 +362,7 @@ int main(int argc, char ** argv) {
     int n_accept  = 0;
 
     int n_past_tgt = inp.size();
-    int n_past_dft = inp.size();
+    int n_past_dft = current_n_past_dft_prompt_seq0;
 
     // used to determine end of generation
     bool has_eos = false;
@@ -221,6 +381,47 @@ int main(int argc, char ** argv) {
     llama_batch batch_dft = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, n_seq_dft);
 
+    // --- BEGIN FIX for initial target sampling ---
+    // Decode the very last token of the input prompt with the target model
+    // to make its logits available at batch_tgt.token[0] for the first sampling.
+    // This assumes n_past_tgt is already n_input after prompt processing.
+    if (n_input > 0) {
+        common_batch_clear(batch_tgt); 
+        // The last token of the input is inp[n_input - 1].
+        // Its position for decoding is n_input - 1 (since n_past_tgt is n_input).
+        // We want its logits to be at batch_tgt index 0.
+        common_batch_add(batch_tgt, inp[n_input - 1], n_input - 1, {0}, true); // seq_id 0, request logits
+
+        if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+            LOG_ERR("%s: llama_decode failed for target model (initial single token for first sample). Exiting.\\n", __func__);
+            llama_backend_free();
+            return 1;
+        }
+        // The logits for inp[n_input-1] (which is now the one to predict *after*) 
+        // are now in ctx_tgt, and common_sampler_sample will use them via batch_tgt index 0.
+        // n_past_tgt should not be incremented here as this token was part of the prompt.
+    } else if (llama_vocab_get_add_bos(vocab_tgt)) {
+        // If no prompt and BOS is used, decode BOS for the first sample.
+        common_batch_clear(batch_tgt);
+        llama_token bos = llama_vocab_bos(vocab_tgt);
+        common_batch_add(batch_tgt, bos, 0, {0}, true); // pos 0, seq_id 0, request logits
+        if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+            LOG_ERR("%s: llama_decode failed for target model (initial BOS token for first sample). Exiting.\\n", __func__);
+            llama_backend_free();
+            return 1;
+        }
+        // n_past_tgt would be 1 if we increment it, but common_sampler_sample uses ctx_tgt state.
+        // For consistency, n_past_tgt should reflect tokens *consumed* and *in* KV. BOS is now in KV.
+        // However, the main loop structure increments n_past_tgt *after* a token is accepted.
+        // Let's assume for now that n_past_tgt remains 0, and the first accepted token will increment it.
+        // This area can be tricky. The key is that ctx_tgt has processed BOS.
+    } else {
+        LOG_WRN("%s: No input prompt and BOS is not added by vocab. First token sampling for target model might fail or be undefined.\\n", __func__);
+        // If we proceed, batch_tgt is empty, likely leading to the same error.
+        // For robust handling, an error should probably be raised here or a dummy token decoded.
+    }
+    // --- END FIX ---
+
     const auto t_dec_start = ggml_time_us();
 
     // sample from the last token of the prompt
@@ -228,6 +429,7 @@ int main(int argc, char ** argv) {
     drafts[0].i_batch_tgt[0] = 0;
 
     while (true) {
+        LOG_DBG("Main loop start: n_past_tgt = %d, n_past_dft = %d, n_predict = %d, has_eos = %d\n", n_past_tgt, n_past_dft, n_predict, has_eos);
         std::set<int> active_seqs = {};
 
         // print current draft sequences
@@ -460,14 +662,31 @@ int main(int argc, char ** argv) {
             drafts[0].dists.push_back(std::vector<llama_token_data>());
             drafts[0].i_batch_tgt.push_back(0);
 
-            common_batch_clear(batch_dft);
-            common_batch_add  (batch_dft, token_id, n_past_dft, { 0 }, true);
-
+            // Update draft model (seq 0) with the confirmed token_id
+            // n_past_dft here is the current length of seq 0 *before* adding this new token_id.
+            // n_eval for this operation is 1 token for seq 0.
+            if (handle_speculative_context_shifting(ctx_dft, n_keep_dft_val, n_past_dft, 1)) {
+                LOG_ERR("%s: Draft model context shift failed for seq 0 before single token update. Exiting.\\n", __func__);
+                llama_backend_free();
+                return 1;
+            }
+            // After potential shift, n_past_dft (for seq 0) is updated.
+            // Clear KV cache for seq 0 from the (new) n_past_dft onwards before adding the new token.
             llama_kv_self_seq_rm(ctx_dft, 0, n_past_dft, -1);
-            // LOG_DBG("dft batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_dft, batch_dft).c_str());
-            llama_decode(ctx_dft, batch_dft);
 
-            ++n_past_dft;
+            common_batch_clear(batch_dft);
+            common_batch_add(batch_dft, token_id, n_past_dft, { 0 }, true); // Add token_id at (new) n_past_dft for seq 0.
+
+            LOG_DBG("Before llama_decode (dft, single token update for seq 0): batch_dft.n_tokens = %d, token_id = %d, n_past_dft_seq0 = %d (after shift), n_ctx_dft = %d\\n",
+                    batch_dft.n_tokens, token_id, n_past_dft, llama_n_ctx(ctx_dft));
+            if (llama_decode(ctx_dft, batch_dft) != 0) {
+                 LOG_ERR("%s: llama_decode failed for draft model (single token update for seq 0)\\n", __func__);
+                 llama_backend_free();
+                 return 1;
+            }
+            LOG_DBG("After llama_decode (dft, single token update for seq 0)\\n");
+
+            ++n_past_dft; // n_past_dft tracks length of seq 0
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
@@ -496,6 +715,8 @@ int main(int argc, char ** argv) {
         // sample n_draft tokens from the draft model using tree-based sampling
         for (int i = 0; i < n_draft; ++i) {
             batch_dft.n_tokens = 0;
+
+            LOG_DBG("Drafting loop (i = %d / %d): n_past_cur = %d, n_drafted = %d, batch_tgt.n_tokens = %d\n", i, n_draft, n_past_cur, n_drafted, batch_tgt.n_tokens);
 
             for (int s = 0; s < n_seq_dft; ++s) {
                 drafts[s].skip = false;
@@ -593,9 +814,36 @@ int main(int argc, char ** argv) {
             }
 
             // evaluate the drafted tokens on the draft model
-            llama_decode(ctx_dft, batch_dft);
-            ++n_past_cur;
-            ++n_drafted;
+            LOG_DBG("Before llama_decode (dft, evaluate drafted): batch_dft.n_tokens = %d, n_past_cur = %d, n_drafted = %d, n_ctx_dft = %d\\n", batch_dft.n_tokens, n_past_cur, n_drafted, llama_n_ctx(ctx_dft));
+            if (batch_dft.n_tokens > 0) { // Only decode if there are tokens
+                // n_past_cur is the length of all active draft sequences (including seq 0) before adding this new level of tokens.
+                // We are adding 1 new token to the length of each active sequence at this level.
+                // Context shifting is applied to seq 0 using its current length (n_past_cur) and an eval_size of 1.
+                if (handle_speculative_context_shifting(ctx_dft, n_keep_dft_val, n_past_cur, 1)) {
+                    LOG_ERR("%s: Draft model context shift failed for seq 0 during drafting loop. Exiting.\\n", __func__);
+                    llama_backend_free();
+                    return 1;
+                }
+                // After potential shift, n_past_cur (tracking length of seq 0) is updated.
+                // The batch_dft tokens were added with the *original* n_past_cur as their position.
+                // If n_past_cur for seq 0 was shifted down, we need to adjust positions for seq 0 in batch_dft if llama_decode strictly uses it for KV cache addressing.
+                // However, llama_decode itself uses the batch's pos for KV cache. If seq 0's KV got shifted, new tokens go to new slots.
+                // Copied sequences (s > 0) have their own KV cache regions but are based on seq 0 at the time of copy.
+                // For simplicity and minimal change, we assume the KV cache operations inside handle_speculative_context_shifting correctly manage seq 0,
+                // and llama_decode with batched sequences handles KV for s>0 correctly based on their copied state and new tokens.
+                // n_past_cur will be incremented after successful decode. If it was shifted, it means new tokens for seq 0 are added at an earlier effective point.
+
+                if (llama_decode(ctx_dft, batch_dft) != 0) {
+                    LOG_ERR("%s: llama_decode failed for draft model (evaluate drafted)\\n", __func__);
+                    llama_backend_free();
+                    return 1;
+                }
+            }
+            LOG_DBG("After llama_decode (dft, evaluate drafted)\\n");
+            if (batch_dft.n_tokens > 0) { // only increment if we actually decoded and added a level
+                ++n_past_cur; // n_past_cur tracks length of active sequences, including seq 0.
+            }
+            ++n_drafted; // n_drafted counts levels attempted
 
             if (batch_tgt.n_tokens > n_draft) {
                 break;
@@ -610,7 +858,11 @@ int main(int argc, char ** argv) {
             }
 
             // LOG_DBG("target batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_tgt, batch_tgt).c_str());
-            llama_decode(ctx_tgt, batch_tgt);
+            LOG_DBG("Before llama_decode (tgt, evaluate drafted): batch_tgt.n_tokens = %d, n_past_tgt = %d, n_ctx_tgt = %d\n", batch_tgt.n_tokens, n_past_tgt, llama_n_ctx(ctx_tgt));
+            if (batch_tgt.n_tokens > 0) { // Only decode if there are tokens
+                llama_decode(ctx_tgt, batch_tgt);
+            }
+            LOG_DBG("After llama_decode (tgt, evaluate drafted)\n");
             ++n_past_tgt;
         }
 

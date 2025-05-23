@@ -83,6 +83,55 @@ static void sigint_handler(int signo) {
 }
 #endif
 
+// Returns true if generation should stop, false otherwise.
+static bool handle_context_shifting(
+    llama_context *ctx,
+    const common_params &params,
+    int &n_past, // Input/Output
+    int n_ctx,
+    std::string &path_session, // Input/Output
+    int n_eval // Used for context check and logging
+) {
+    if (n_past + n_eval + params.n_ubatch < n_ctx) {
+        return false; // Not enough tokens to trigger shifting, continue.
+    }
+
+    // Context is full or will be with current_embd
+    if (!params.ctx_shift) {
+        LOG_DBG("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
+        return true; // Stop
+    }
+
+    if (params.n_predict == -2) {
+        LOG_DBG("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
+        return true; // Stop
+    }
+
+    const int n_left = n_past - params.n_keep;
+    int n_discard = 0;
+    if (n_left > 0) {
+        n_discard = n_left / 2;
+    }
+
+    LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
+            n_past, n_left, n_ctx, params.n_keep, n_discard);
+
+    if (n_discard > 0) {
+        llama_kv_self_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
+        llama_kv_self_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
+        n_past -= n_discard;
+
+        LOG_DBG("after swap: n_past = %d\n", n_past);
+
+        LOG_DBG("clear session path\n");
+        path_session.clear();
+    } else {
+        LOG_DBG("n_discard is %d (n_past=%d, n_keep=%d), no tokens effectively shifted from KV cache.\n", n_discard, n_past, params.n_keep);
+    }
+
+    return false; // Continue processing
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     g_params = &params;
@@ -285,6 +334,9 @@ int main(int argc, char ** argv) {
             std::ostringstream ss;
             ss << fin.rdbuf();
             params.prompt = ss.str();
+            if (!params.prompt.empty() && params.prompt.back() == '\\n') {
+                params.prompt.pop_back();
+            }
         }
         // LOG_INF("prompt: %s, prompt length: %zu\n", params.prompt.c_str(), params.prompt.length());
 
@@ -337,10 +389,12 @@ int main(int argc, char ** argv) {
     }
 
     // Tokenize negative prompt
+    /* Disable this check to allow processing of prompts longer than n_ctx using sliding window
     if ((int) embd_inp.size() > n_ctx - 4) {
-        LOG_ERR("%s: prompt is too long (%d tokens, max %d)\n", __func__, (int) embd_inp.size(), n_ctx - 4);
+        LOG_ERR("%s: prompt is too long (%d tokens, max %d)\\n", __func__, (int) embd_inp.size(), n_ctx - 4);
         return 1;
     }
+    */
 
     // debug message about similarity of saved session, if applicable
     size_t n_matching_session_tokens = 0;
@@ -594,35 +648,8 @@ int main(int argc, char ** argv) {
                 // if we run out of context:
                 // - take the n_keep first tokens from the original prompt (via n_past)
                 // - take half of the last (n_ctx - n_keep) tokens and recompute the logits in batches
-
-                if (n_past + (int) embd.size() >= n_ctx) {
-                    if (!params.ctx_shift){
-                        LOG_DBG("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
-                        break;
-                    }
-
-                    if (params.n_predict == -2) {
-                        LOG_DBG("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
-                        break;
-                    }
-
-                    const int n_left    = n_past - params.n_keep;
-                    const int n_discard = n_left/2;
-
-                    LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
-                            n_past, n_left, n_ctx, params.n_keep, n_discard);
-
-                    llama_kv_self_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
-                    llama_kv_self_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
-
-                    n_past -= n_discard;
-
-                    LOG_DBG("after swap: n_past = %d\n", n_past);
-
-                    LOG_DBG("embd: %s\n", string_from(ctx, embd).c_str());
-
-                    LOG_DBG("clear session path\n");
-                    path_session.clear();
+                if (handle_context_shifting(ctx, params, n_past, n_ctx, path_session, embd.size())) {
+                    break; // Stop generation
                 }
             } else {
                 // context extension via Self-Extend
@@ -677,6 +704,10 @@ int main(int argc, char ** argv) {
                 }
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
+                if (handle_context_shifting(ctx, params, n_past, n_ctx, path_session, n_eval)) {
+                    LOG_ERR("failed to handle context shifting\n");
+                    return 1;
+                }
 
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
