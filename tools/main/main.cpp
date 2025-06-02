@@ -672,6 +672,13 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    // Pause before starting prefill if we have tokens to process and not in interactive mode
+    if (!waiting_for_first_input && !embd_inp.empty() && !params.interactive) {
+        LOG("Please Press Enter to Start Prefilling...\n");
+        std::string dummy;
+        std::getline(std::cin, dummy);
+    }
+
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -804,6 +811,18 @@ int main(int argc, char ** argv) {
         } else {
             // some user input remains from prompt or interaction, forward it to processing
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
+            
+            // Track prefill progress for display
+            static bool prefill_started = false;
+            static int total_prefill_tokens = 0;
+            static bool first_progress_shown = false;
+            
+            if (!prefill_started && (int) embd_inp.size() > n_consumed) {
+                prefill_started = true;
+                total_prefill_tokens = (int) embd_inp.size();
+                first_progress_shown = false;
+            }
+            
             while ((int) embd_inp.size() > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
 
@@ -812,9 +831,28 @@ int main(int argc, char ** argv) {
                 common_sampler_accept(smpl, embd_inp[n_consumed], /* accept_grammar= */ false);
 
                 ++n_consumed;
+                
+                // Display prefill progress
+                if (prefill_started && total_prefill_tokens > 0) {
+                    float progress = (float)n_consumed / total_prefill_tokens * 100.0f;
+                    if (!first_progress_shown) {
+                        // Clear any previous line content before showing first progress
+                        printf("\r\033[K");
+                        first_progress_shown = true;
+                    }
+                    printf("\rPrefilling: %.1f%% (%d/%d tokens)", progress, n_consumed, total_prefill_tokens);
+                    fflush(stdout);
+                }
+                
                 if ((int) embd.size() >= params.n_batch) {
                     break;
                 }
+            }
+            
+            // Clear progress display when prefill is complete
+            if (prefill_started && n_consumed >= total_prefill_tokens) {
+                printf("\rPrefilling: 100.0%% (%d/%d tokens) - Complete!\n", total_prefill_tokens, total_prefill_tokens);
+                prefill_started = false;
             }
         }
 
