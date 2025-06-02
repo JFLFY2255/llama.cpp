@@ -324,21 +324,67 @@ int main(int argc, char ** argv) {
 
     std::string prompt;
     {
-        // 支持 -p @file.txt 方式从文件读取prompt
-        if (!params.prompt.empty() && params.prompt[0] == '@') {
-            std::ifstream fin(params.prompt.substr(1));
-            if (!fin) {
-                LOG_ERR("无法打开prompt文件: %s\n", params.prompt.substr(1).c_str());
-                return 1;
+        // 支持多个 -p 参数，包括 @file.txt 方式从文件读取和文本内容的混合
+        std::string final_prompt;
+        std::string current_prompt = params.prompt;
+        
+        // 按照 -p 参数的顺序处理，查找 @file.txt 格式
+        size_t pos = 0;
+        while (pos < current_prompt.length()) {
+            // 查找下一个可能的文件引用
+            size_t at_pos = current_prompt.find('@', pos);
+            
+            if (at_pos == std::string::npos) {
+                // 没有更多的@符号，添加剩余的所有内容
+                final_prompt += current_prompt.substr(pos);
+                break;
             }
-            std::ostringstream ss;
-            ss << fin.rdbuf();
-            params.prompt = ss.str();
-            if (!params.prompt.empty() && params.prompt.back() == '\\n') {
-                params.prompt.pop_back();
+            
+            // 添加@符号之前的内容
+            if (at_pos > pos) {
+                final_prompt += current_prompt.substr(pos, at_pos - pos);
+            }
+            
+            // 检查这是否是文件引用（@开头的单词）
+            size_t file_start = at_pos + 1;
+            size_t file_end = file_start;
+            
+            // 查找文件名的结束位置（遇到空格、换行等）
+            while (file_end < current_prompt.length() && 
+                   current_prompt[file_end] != ' ' && 
+                   current_prompt[file_end] != '\n' && 
+                   current_prompt[file_end] != '\t' &&
+                   current_prompt[file_end] != '\r') {
+                file_end++;
+            }
+            
+            if (file_end > file_start) {
+                // 提取文件名
+                std::string filename = current_prompt.substr(file_start, file_end - file_start);
+                
+                // 尝试读取文件
+                std::ifstream fin(filename);
+                if (fin) {
+                    std::ostringstream ss;
+                    ss << fin.rdbuf();
+                    std::string file_content = ss.str();
+                    if (!file_content.empty() && file_content.back() == '\n') {
+                        file_content.pop_back();
+                    }
+                    final_prompt += file_content;
+                } else {
+                    // 文件读取失败，保留原来的@filename
+                    final_prompt += current_prompt.substr(at_pos, file_end - at_pos);
+                }
+                pos = file_end;
+            } else {
+                // @后面没有文件名，保留@符号
+                final_prompt += '@';
+                pos = at_pos + 1;
             }
         }
-        // LOG_INF("prompt: %s, prompt length: %zu\n", params.prompt.c_str(), params.prompt.length());
+        
+        params.prompt = final_prompt;
 
         if (params.conversation_mode && params.enable_chat_template) {
             if (!params.system_prompt.empty()) {

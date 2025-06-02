@@ -1468,9 +1468,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_FLASH_ATTN"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
-        "prompt to start generation with; for system message, use -sys",
+        "prompt to start generation with; for system message, use -sys\n"
+        "can be specified multiple times to concatenate prompts",
         [](common_params & params, const std::string & value) {
-            params.prompt = value;
+            if (!params.prompt.empty()) {
+                // append to existing prompt
+                params.prompt += value;
+            } else {
+                params.prompt = value;
+            }
         }
     ).set_excludes({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
