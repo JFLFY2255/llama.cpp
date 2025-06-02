@@ -674,9 +674,12 @@ int main(int argc, char ** argv) {
 
     // Pause before starting prefill if we have tokens to process and not in interactive mode
     if (!waiting_for_first_input && !embd_inp.empty() && !params.interactive) {
+        // Clear screen and move cursor to top
+        printf("\033[2J\033[H");
         LOG("Please Press Enter to Start Prefilling...\n");
         std::string dummy;
         std::getline(std::cin, dummy);
+        // Don't print "Starting Prefilling..." here as it interferes with progress display
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
