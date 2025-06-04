@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <chrono>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -263,7 +264,7 @@ int main(int argc, char ** argv) {
     // print chat template example in conversation mode
     if (params.conversation_mode) {
         if (params.enable_chat_template) {
-            if (!params.prompt.empty() && params.system_prompt.empty()) {
+            if (!params.system_prompt.empty() && params.system_prompt.empty()) {
                 LOG_WRN("*** User-specified prompt will pre-start conversation, did you mean to set --system-prompt (-sys) instead?\n");
             }
 
@@ -676,10 +677,12 @@ int main(int argc, char ** argv) {
     if (!waiting_for_first_input && !embd_inp.empty() && !params.interactive) {
         // Clear screen and move cursor to top
         printf("\033[2J\033[H");
-        LOG("Please Press Enter to Start Prefilling...\n");
+        LOG("Please Press Enter to Start Prefilling...");
         std::string dummy;
         std::getline(std::cin, dummy);
-        // Don't print "Starting Prefilling..." here as it interferes with progress display
+        // Replace the prompt with [Prefilling] status on the same line
+        printf("\r\033[K[Prefilling]\n");
+        fflush(stdout);
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
@@ -819,11 +822,13 @@ int main(int argc, char ** argv) {
             static bool prefill_started = false;
             static int total_prefill_tokens = 0;
             static bool first_progress_shown = false;
+            static std::chrono::high_resolution_clock::time_point prefill_start_time;
             
             if (!prefill_started && (int) embd_inp.size() > n_consumed) {
                 prefill_started = true;
                 total_prefill_tokens = (int) embd_inp.size();
                 first_progress_shown = false;
+                prefill_start_time = std::chrono::high_resolution_clock::now();
             }
             
             while ((int) embd_inp.size() > n_consumed) {
@@ -838,12 +843,16 @@ int main(int argc, char ** argv) {
                 // Display prefill progress
                 if (prefill_started && total_prefill_tokens > 0) {
                     float progress = (float)n_consumed / total_prefill_tokens * 100.0f;
-                    if (!first_progress_shown) {
-                        // Clear any previous line content before showing first progress
-                        printf("\r\033[K");
-                        first_progress_shown = true;
-                    }
-                    printf("\rPrefilling: %.1f%% (%d/%d tokens)", progress, n_consumed, total_prefill_tokens);
+                    
+                    // Calculate token rate
+                    auto current_time = std::chrono::high_resolution_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - prefill_start_time);
+                    double elapsed_seconds = elapsed.count() / 1000.0;
+                    double token_rate = (elapsed_seconds > 0) ? n_consumed / elapsed_seconds : 0.0;
+                    
+                    // Clear current line and show progress
+                    printf("\r\033[KPrefilling: %.1f%% (%d/%d tokens) @ %.1f tokens/s", 
+                           progress, n_consumed, total_prefill_tokens, token_rate);
                     fflush(stdout);
                 }
                 
@@ -854,7 +863,15 @@ int main(int argc, char ** argv) {
             
             // Clear progress display when prefill is complete
             if (prefill_started && n_consumed >= total_prefill_tokens) {
-                printf("\rPrefilling: 100.0%% (%d/%d tokens) - Complete!\n", total_prefill_tokens, total_prefill_tokens);
+                auto final_time = std::chrono::high_resolution_clock::now();
+                auto total_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(final_time - prefill_start_time);
+                double total_seconds = total_elapsed.count() / 1000.0;
+                double final_rate = (total_seconds > 0) ? total_prefill_tokens / total_seconds : 0.0;
+                
+                // Show final completion status and then decoding status
+                printf("\r\033[KPrefilling: 100.0%% (%d/%d tokens) @ %.1f tokens/s - Complete!\n\n[Decoding]\n", 
+                       total_prefill_tokens, total_prefill_tokens, final_rate);
+                fflush(stdout);
                 prefill_started = false;
             }
         }
