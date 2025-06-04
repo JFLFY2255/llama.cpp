@@ -682,6 +682,7 @@ int main(int argc, char ** argv) {
     if (!waiting_for_first_input && !embd_inp.empty() && !params.interactive) {
         // Clear screen completely before showing prompt
         printf("\n\n\n");
+        fprintf(stderr, "\n\n\n");
         fflush(stdout);
         fflush(stderr);
         printf("\033[2J\033\033[H");
@@ -800,6 +801,18 @@ int main(int argc, char ** argv) {
         embd.clear();
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
+            // Wait for user input before entering decode phase if requested
+            static bool decode_enter_shown = false;
+            if (params.use_decode_enter && !decode_enter_shown && !params.interactive) {
+                decode_enter_shown = true;
+                LOG("Please Press Enter to Start Decoding...");
+                std::string dummy;
+                std::getline(std::cin, dummy);
+                // Clear the prompt line and move cursor to beginning
+                printf("\r\033[K");
+                fflush(stdout);
+            }
+            
             // optionally save the session on first sample (for faster prompt loading next time)
             if (!path_session.empty() && need_to_save_session && !params.prompt_cache_ro) {
                 need_to_save_session = false;

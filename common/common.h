@@ -368,6 +368,7 @@ struct common_params {
     bool enable_chat_template = true;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     bool skip_think = false; // add empty <think></think> to skip thinking mode for Qwen3
+    bool use_decode_enter = false; // wait for user input before entering decode phase
 
     std::vector<std::string> api_keys;
 

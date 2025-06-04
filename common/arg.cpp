@@ -2864,11 +2864,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MAIN}).set_env("LLAMA_ARG_THINK"));
     add_opt(common_arg(
         {"--skip-think"},
-        "add empty <think></think> tags to skip thinking mode for Qwen3 models",
+        "add empty <think></think> to skip thinking mode for Qwen3",
         [](common_params & params) {
             params.skip_think = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_MAIN, LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_MAIN}).set_env("LLAMA_ARG_SKIP_THINK"));
+    add_opt(common_arg(
+        {"--use-decode-enter"}, 
+        "wait for user input before entering decode phase",
+        [](common_params & params) {
+            params.use_decode_enter = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MAIN}).set_env("LLAMA_ARG_USE_DECODE_ENTER"));
     add_opt(common_arg(
         {"--chat-template"}, "JINJA_TEMPLATE",
         string_format(
