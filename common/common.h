@@ -367,6 +367,7 @@ struct common_params {
     bool use_jinja = false;                                                                                 // NOLINT
     bool enable_chat_template = true;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    bool skip_think = false; // add empty <think></think> to skip thinking mode for Qwen3
 
     std::vector<std::string> api_keys;
 

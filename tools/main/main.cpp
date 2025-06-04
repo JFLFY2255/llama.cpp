@@ -406,6 +406,11 @@ int main(int argc, char ** argv) {
                 inputs.add_generation_prompt = !params.prompt.empty();
 
                 prompt = common_chat_templates_apply(chat_templates.get(), inputs).prompt;
+                
+                // Add <think></think> to skip thinking mode for Qwen3
+                if (params.skip_think && !params.prompt.empty()) {
+                    prompt += "<think></think>";
+                }
             }
         } else {
             // otherwise use the prompt as is
